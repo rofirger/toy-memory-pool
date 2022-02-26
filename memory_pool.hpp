@@ -35,7 +35,7 @@ namespace rofirger
 			struct _memory_header* _offset_base_addr;		 // this block is divided from chunk. Serve only as a base address!
 			blksts_t _tag;									 // block status. 0:free block, 1:occupied block
 			blkpow_t _pval;									 // block size = pow(2, pval)
-			bool _is_max_block;
+			blkpow_t _dc_diff;								 // Add 1 when block is divided once, subtract 1 when combined.
 		}_memory_header, * _ptrmemory_header;
 
 	private:
@@ -87,16 +87,16 @@ namespace rofirger
 			_ptrmemory_header block_ = reinterpret_cast<_ptrmemory_header>(_block_);
 			if (_table[_pow_] != nullptr)
 			{
-				_ptrmemory_header p_ = _table[_pow_];
-				while (p_->_rlink != _table[_pow_])
-					p_ = p_->_rlink;
-				block_->_rlink = _table[_pow_];
+				block_->_llink = _table[_pow_]->_llink;
+				_table[_pow_]->_llink->_rlink = block_;
 				_table[_pow_]->_llink = block_;
-				block_->_llink = p_;
-				p_->_rlink = block_;
+				block_->_rlink = _table[_pow_];
 				return;
 			}
+			block_->_rlink = block_;
+			block_->_llink = block_;
 			_table[_pow_] = block_;
+			_subtable_blocks_node_unallocated_size[_pow_] += ((1 << _pow_) & (~block_->_tag));
 		}
 
 		void InsertBlockIntoSubTable(const blkpow_t& _target_pow_, const int _insert_num_) throw(std::bad_alloc)
@@ -110,7 +110,7 @@ namespace rofirger
 					reinterpret_cast<_ptrmemory_header>(block_),
 					reinterpret_cast<_ptrmemory_header>(block_),
 					reinterpret_cast<_ptrmemory_header>(block_),
-					0, _target_pow_, true
+					0, _target_pow_, 0
 				};
 				InserBlock(block_, _target_pow_);
 			}
@@ -120,7 +120,6 @@ namespace rofirger
 		void ExpandPool(const blkpow_t& _lack_pow_, const int _insert_num_ = 2) throw(std::bad_alloc)
 		{
 			InsertBlockIntoSubTable(_lack_pow_, _insert_num_);
-			_subtable_blocks_node_unallocated_size[_lack_pow_] += ((1 << _lack_pow_) * _insert_num_);
 		}
 
 
@@ -167,18 +166,21 @@ namespace rofirger
 			for (blkpow_t i_ = _valid_index_._idea_table_index; i_ < _valid_index_._real_table_index; ++i_)
 			{
 				void* p_division_block_ = reinterpret_cast<void*>(reinterpret_cast<char*>(_block_addr_) + (1 << i_));
-				new(p_division_block_) _memory_header{ nullptr,nullptr,p_->_offset_base_addr,0,i_,false };
+				new(p_division_block_) _memory_header{ nullptr,nullptr,p_->_offset_base_addr,0,i_,0 };
 				InserBlock(p_division_block_, i_);
 			}
+			PopBlockOut(_block_addr_);
 			p_->_pval = _valid_index_._idea_table_index;
 			p_->_tag = 1;
+			reinterpret_cast<_ptrmemory_header>(p_->_offset_base_addr)->_dc_diff += (_valid_index_._real_table_index - _valid_index_._idea_table_index);
+			InserBlock(_block_addr_, p_->_pval);
 			return _block_addr_;
 		}
 
 		void* FindBuddy(void* _block_)
 		{
 			_ptrmemory_header p_ = reinterpret_cast<_ptrmemory_header>(_block_);
-			if (p_->_is_max_block)
+			if (reinterpret_cast<_ptrmemory_header>(p_->_offset_base_addr)->_dc_diff == 0)
 			{
 				return nullptr;
 			}
@@ -193,8 +195,33 @@ namespace rofirger
 		void PopBlockOut(void* _block_)
 		{
 			_ptrmemory_header p_ = reinterpret_cast<_ptrmemory_header>(_block_);
+			if (p_ == _table[p_->_pval])
+			{
+				if (p_->_llink != p_)
+					_table[p_->_pval] = p_->_rlink;
+				else
+					_table[p_->_pval] = nullptr;
+			}
 			p_->_llink->_rlink = p_->_rlink;
 			p_->_rlink->_llink = p_->_llink;
+			_subtable_blocks_node_unallocated_size[p_->_pval] -= ((1 << p_->_pval) & (~p_->_tag));
+		}
+
+		void ZeroAllBlockTag()
+		{
+			for (blkpow_t i_ = 0; i_ < _arrsize; ++i_)
+			{
+				if (_table[i_] != nullptr)
+				{
+					_ptrmemory_header p_ = reinterpret_cast<_ptrmemory_header>(_table[i_]);
+					p_->_tag = 0;
+					while (p_->_rlink != _table[i_])
+					{
+						p_->_rlink->_tag = 0;
+						p_ = p_->_rlink;
+					}
+				}
+			}
 		}
 
 	public:
@@ -207,7 +234,6 @@ namespace rofirger
 			++_pools;
 			_init_pow = _init_pow_, _init_pow_block_num = _init_pow_block_num_;
 			InsertBlockIntoSubTable(_init_pow, _init_pow_block_num);
-			std::cout << "调用MemoryPool构造函数(MemoryPool(const int _init_pow_, const int _init_pow_block_num_))" << _init_pow_ << "\t\t" << _init_pow_block_num_ << std::endl;
 		}
 		bool SetPool(const int _init_pow_, const int _init_pow_block_num_)
 		{
@@ -228,8 +254,19 @@ namespace rofirger
 			size_t real_alloc_ = __n + sizeof(_memory_header);
 			std::lock_guard<std::recursive_mutex> lock_(_malloc_recursive_mutex);
 			ValidIndexRet valid_index_ret_ = FindValidTableIndex(real_alloc_);
-			void* malloc_block_ = BlockDivision(valid_index_ret_, FindFreeBlock(valid_index_ret_._real_table_index));
-			return malloc_block_;
+			void* free_block_ = FindFreeBlock(valid_index_ret_._real_table_index);
+			void* malloc_block_ = free_block_;
+			if (valid_index_ret_._idea_table_index != valid_index_ret_._real_table_index)
+			{
+				malloc_block_ = BlockDivision(valid_index_ret_, free_block_);
+			}
+			else
+			{
+				_ptrmemory_header p_temp_ = reinterpret_cast<_ptrmemory_header>(malloc_block_);
+				p_temp_->_tag = 1;
+				_subtable_blocks_node_unallocated_size[p_temp_->_pval] -= (1 << p_temp_->_pval);
+			}
+			return reinterpret_cast<void*>(reinterpret_cast<char*>(malloc_block_) + sizeof(_memory_header));
 		}
 
 		/*
@@ -238,7 +275,7 @@ namespace rofirger
 		void ordered_free(void* _block_)
 		{
 			_ptrmemory_header p_header_ = reinterpret_cast<_ptrmemory_header>(reinterpret_cast<char*>(_block_) - sizeof(_memory_header));
-			void* p_buddy_void_ = FindBuddy(_block_);
+			void* p_buddy_void_ = FindBuddy(reinterpret_cast<void*>(p_header_));
 			if (p_buddy_void_ == nullptr)
 			{
 				p_header_->_tag = 0;
@@ -248,18 +285,19 @@ namespace rofirger
 			if (p_buddy_header_->_tag == 0)
 			{
 				std::ptrdiff_t diff_ = reinterpret_cast<char*>(_block_) - reinterpret_cast<char*>(p_buddy_void_);
-				PopBlockOut(_block_);
+				PopBlockOut(reinterpret_cast<void*>(p_header_));
 				PopBlockOut(p_buddy_void_);
 				if (diff_ < 0)
 				{
 					p_header_->_pval++;
-					InserBlock(_block_, p_header_->_pval);
+					InserBlock(reinterpret_cast<void*>(p_header_), p_header_->_pval);
 				}
 				else
 				{
 					p_buddy_header_->_pval++;
 					InserBlock(p_buddy_void_, p_buddy_header_->_pval);
 				}
+				reinterpret_cast<_ptrmemory_header>(p_header_->_offset_base_addr)->_dc_diff--;
 			}
 
 			p_header_->_tag = 0;
@@ -275,10 +313,14 @@ namespace rofirger
 					p_user_memory_area_ = reinterpret_cast<void*>(reinterpret_cast<char*>(_table[i_]) + sizeof(_memory_header));
 					ordered_free(p_user_memory_area_);
 					_ptrmemory_header p_ = _table[i_];
+					if (nullptr == p_)
+						continue;
 					while (p_->_rlink != _table[i_])
 					{
 						p_user_memory_area_ = reinterpret_cast<void*>(reinterpret_cast<char*>(p_->_rlink) + sizeof(_memory_header));
 						ordered_free(p_user_memory_area_);
+						if (nullptr == _table[i_])
+							break;;
 						p_ = p_->_rlink;
 					}
 				}
@@ -287,21 +329,18 @@ namespace rofirger
 
 		void operator delete(void* _ptr_)
 		{
-			std::cout << "rofirger delete(void*)" << std::endl;
 			if (_ptr_)
 				::free(_ptr_);
 		}
 
 		void operator delete[](void* _ptr_)
 		{
-			std::cout << "rofirger delete[](void*)" << std::endl;
 			if (_ptr_)
 				::free(_ptr_);
 		}
 
 			void* operator new(std::size_t __size, void* __p)
 		{
-			std::cout << "rofirger new(size_t, void*)" << __size << std::endl;
 			(void)__size;
 			return __p;
 		}
@@ -311,7 +350,6 @@ namespace rofirger
 		*/
 		void* operator new(std::size_t __size) throw(std::bad_alloc)
 		{
-			std::cout << "rofirger new(size_t)" << __size << std::endl;
 			if (__size == 0) { __size = 1; }
 			void* malloc_memory_ = ::malloc(__size);
 			while (malloc_memory_ == nullptr)
@@ -330,7 +368,6 @@ namespace rofirger
 		*/
 		void* operator new[](std::size_t __size) throw(std::bad_alloc)
 		{
-			std::cout << "rofirger new(size_t)" << __size << std::endl;
 			if (__size == 0) { __size = 1; }
 			void* malloc_memory_ = ::malloc(__size);
 			while (malloc_memory_ == nullptr)
@@ -365,8 +402,8 @@ namespace rofirger
 					printf("\r\n");
 					do
 					{
-						printf("llink: %p\trlink: %p\toffset_base_addr: %p\ttag: %d\tpval: %d\r\n",
-							p_->_llink, p_->_rlink, p_->_offset_base_addr, p_->_tag, p_->_pval);
+						printf("llink: %p\trlink: %p\toffset_base_addr: %p\ttag: %d\tpval: %d\tdc_diff: %d\r\n",
+							p_->_llink, p_->_rlink, p_->_offset_base_addr, p_->_tag, p_->_pval, p_->_dc_diff);
 					} while ((p_ = p_->_rlink) != _table[i_]);
 					printf("\r\n\r\n");
 				}
@@ -375,8 +412,8 @@ namespace rofirger
 
 		~MemoryPool()
 		{
-			std::cout << "MemoryPool调用析构函数" << std::endl;
 			// "free" all memory blocks and then uniformly release.
+			ZeroAllBlockTag();
 			OrderedFreeAll();
 			for (blkpow_t i_ = 0; i_ < _arrsize; ++i_)
 			{
