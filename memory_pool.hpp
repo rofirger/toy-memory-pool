@@ -58,7 +58,7 @@ namespace rofirger
 		std::recursive_mutex _malloc_recursive_mutex;
 		_ptrmemory_header _table[_arrsize] = { nullptr };
 		// Indicates whether the list of the subtable contains unallocated nodes
-		size_t _subtable_blocks_node_unallocated_size[_arrsize] = { 0 };
+		long long _subtable_blocks_node_unallocated_size[_arrsize] = { 0 };
 		blkpow_t _init_pow = 0;
 		int _init_pow_block_num = 0;
 	private:
@@ -85,6 +85,8 @@ namespace rofirger
 		void InserBlock(void* _block_, int _pow_)
 		{
 			_ptrmemory_header block_ = reinterpret_cast<_ptrmemory_header>(_block_);
+			if (block_->_tag == 0)
+				_subtable_blocks_node_unallocated_size[_pow_] += (1 << _pow_);
 			if (_table[_pow_] != nullptr)
 			{
 				block_->_llink = _table[_pow_]->_llink;
@@ -96,7 +98,6 @@ namespace rofirger
 			block_->_rlink = block_;
 			block_->_llink = block_;
 			_table[_pow_] = block_;
-			_subtable_blocks_node_unallocated_size[_pow_] += ((1 << _pow_) & (~block_->_tag));
 		}
 
 		void InsertBlockIntoSubTable(const blkpow_t& _target_pow_, const int _insert_num_) throw(std::bad_alloc)
@@ -114,7 +115,6 @@ namespace rofirger
 				};
 				InserBlock(block_, _target_pow_);
 			}
-			_subtable_blocks_node_unallocated_size[_target_pow_] = ((1 << _target_pow_) * _insert_num_);
 		}
 
 		void ExpandPool(const blkpow_t& _lack_pow_, const int _insert_num_ = 2) throw(std::bad_alloc)
@@ -204,7 +204,8 @@ namespace rofirger
 			}
 			p_->_llink->_rlink = p_->_rlink;
 			p_->_rlink->_llink = p_->_llink;
-			_subtable_blocks_node_unallocated_size[p_->_pval] -= ((1 << p_->_pval) & (~p_->_tag));
+			if (p_->_tag == 0)
+				_subtable_blocks_node_unallocated_size[p_->_pval] -= (1 << p_->_pval);
 		}
 
 		void ZeroAllBlockTag()
@@ -276,31 +277,37 @@ namespace rofirger
 		{
 			_ptrmemory_header p_header_ = reinterpret_cast<_ptrmemory_header>(reinterpret_cast<char*>(_block_) - sizeof(_memory_header));
 			void* p_buddy_void_ = FindBuddy(reinterpret_cast<void*>(p_header_));
-			if (p_buddy_void_ == nullptr)
+			while (p_buddy_void_ != nullptr)
 			{
-				p_header_->_tag = 0;
-				return;
-			}
-			_ptrmemory_header p_buddy_header_ = reinterpret_cast<_ptrmemory_header>(p_buddy_void_);
-			if (p_buddy_header_->_tag == 0)
-			{
-				std::ptrdiff_t diff_ = reinterpret_cast<char*>(_block_) - reinterpret_cast<char*>(p_buddy_void_);
-				PopBlockOut(reinterpret_cast<void*>(p_header_));
-				PopBlockOut(p_buddy_void_);
-				if (diff_ < 0)
+				_ptrmemory_header p_buddy_header_ = reinterpret_cast<_ptrmemory_header>(p_buddy_void_);
+				if (p_buddy_header_->_pval != p_header_->_pval)
+					break;
+				if (p_buddy_header_->_tag == 0)
 				{
-					p_header_->_pval++;
-					InserBlock(reinterpret_cast<void*>(p_header_), p_header_->_pval);
+					std::ptrdiff_t diff_ = reinterpret_cast<char*>(_block_) - reinterpret_cast<char*>(p_buddy_void_);
+					PopBlockOut(reinterpret_cast<void*>(p_header_));
+					PopBlockOut(p_buddy_void_);
+					if (diff_ < 0)
+					{
+						p_header_->_pval++;
+						InserBlock(reinterpret_cast<void*>(p_header_), p_header_->_pval);
+						p_buddy_void_ = FindBuddy(reinterpret_cast<void*>(p_header_));
+					}
+					else
+					{
+						p_buddy_header_->_pval++;
+						InserBlock(p_buddy_void_, p_buddy_header_->_pval);
+						p_header_ = p_buddy_header_;
+						p_buddy_void_ = FindBuddy(p_buddy_void_);
+					}
+					reinterpret_cast<_ptrmemory_header>(p_header_->_offset_base_addr)->_dc_diff--;
 				}
 				else
-				{
-					p_buddy_header_->_pval++;
-					InserBlock(p_buddy_void_, p_buddy_header_->_pval);
-				}
-				reinterpret_cast<_ptrmemory_header>(p_header_->_offset_base_addr)->_dc_diff--;
-			}
+					break;
 
+			}
 			p_header_->_tag = 0;
+			_subtable_blocks_node_unallocated_size[p_header_->_pval] += (1 << p_header_->_pval);
 		}
 
 		void OrderedFreeAll()
@@ -320,7 +327,7 @@ namespace rofirger
 						p_user_memory_area_ = reinterpret_cast<void*>(reinterpret_cast<char*>(p_->_rlink) + sizeof(_memory_header));
 						ordered_free(p_user_memory_area_);
 						if (nullptr == _table[i_])
-							break;;
+							break;
 						p_ = p_->_rlink;
 					}
 				}
@@ -400,10 +407,12 @@ namespace rofirger
 					_ptrmemory_header p_ = _table[i_];
 					printf("-- INDEX:	%d", i_);
 					printf("\r\n");
+					printf("FREE MEMORY SIZE: %lld BYTES", _subtable_blocks_node_unallocated_size[i_]);
+					printf("\r\n");
 					do
 					{
-						printf("llink: %p\trlink: %p\toffset_base_addr: %p\ttag: %d\tpval: %d\tdc_diff: %d\r\n",
-							p_->_llink, p_->_rlink, p_->_offset_base_addr, p_->_tag, p_->_pval, p_->_dc_diff);
+						printf("ptr_self:%p\tllink: %p\trlink: %p\toffset_base_addr: %p\ttag: %d\tpval: %d\tdc_diff: %d\r\n",
+							p_, p_->_llink, p_->_rlink, p_->_offset_base_addr, p_->_tag, p_->_pval, p_->_dc_diff);
 					} while ((p_ = p_->_rlink) != _table[i_]);
 					printf("\r\n\r\n");
 				}
